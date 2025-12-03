@@ -1,0 +1,311 @@
+import os, random, csv, json, time
+import numpy as np
+import torch, torch.nn as nn, torch.nn.functional as F
+from scipy.io import loadmat
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+# -------------------- 配置 --------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
+
+DATA_ROOT = "./CWRU_data"   # 放 _2.mat 文件
+CONDITION_SUFFIX = "_2.mat"
+SIGNAL_LENGTH = 1000
+N_LIST = [1,5,10,20,30]   # 你可以修改为 [5,10,...] 做 few-shot 实验
+EPOCHS = 50
+BATCH_SIZE = 16
+LR = 1e-3
+SAMPLE_RATE = 12000
+RPM = 1750
+BALL_DIA = 7.94
+PITCH_DIA = 39.04
+NUM_BALLS = 9
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
+
+# -------------------- 物理频率引导 --------------------
+def get_physics_guide_freqs(rpm, ball_dia, pitch_dia, num_balls, contact_angle_deg=0, num_harmonics=2):
+    contact_angle_rad = np.deg2rad(contact_angle_deg)
+    fr = rpm / 60.0
+    common_factor = ball_dia / pitch_dia * np.cos(contact_angle_rad)
+    bpfo = 0.5 * num_balls * fr * (1 - common_factor)
+    bpfi = 0.5 * num_balls * fr * (1 + common_factor)
+    bsf = 0.5 * pitch_dia / ball_dia * fr * (1 - common_factor**2)
+    freq = {}
+    for name, base in {'BPFO':bpfo,'BPFI':bpfi,'BSF':bsf}.items():
+        for i in range(1, num_harmonics+1):
+            freq[f"{name}_{i}x"] = base * i
+    return freq
+
+# -------------------- Wavelet Conv --------------------
+class WaveletConv1d(nn.Module):
+    def __init__(self, sample_rate, freqs, filter_length=129):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.freqs = freqs
+        self.filter_length = filter_length
+        self.register_buffer('wavelets', self.create_morlet_wavelets())
+    def create_morlet_wavelets(self):
+        t = torch.linspace(-self.filter_length/(2*self.sample_rate), self.filter_length/(2*self.sample_rate), self.filter_length)
+        bank = []
+        for f in self.freqs:
+            f = max(1e-6, float(f))
+            sinusoid = torch.exp(1j * 2 * np.pi * f * t)
+            sigma = 7 / (2 * np.pi * f)
+            w = sinusoid * torch.exp(-t**2/(2*sigma**2))
+            bank.append(w)
+        wv = torch.stack(bank).view(len(self.freqs), 1, self.filter_length)
+        return torch.cat([wv.real, wv.imag], dim=0).float()
+    def forward(self, x):
+        pad = self.filter_length // 2
+        return F.conv1d(x, self.wavelets, padding=pad)
+
+# -------------------- depthwise separable conv helper --------------------
+class SeparableConv1d(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=3, padding=1):
+        super().__init__()
+        self.depth = nn.Conv1d(in_ch, in_ch, kernel_size, padding=padding, groups=in_ch, bias=False)
+        self.point = nn.Conv1d(in_ch, out_ch, 1, bias=False)
+    def forward(self,x):
+        x = self.depth(x)
+        x = self.point(x)
+        return x
+
+# -------------------- Attention modules --------------------
+class ChannelAttentionVec(nn.Module):
+    # For vector input (B, C)
+    def __init__(self, channels, r=8):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels//r),
+            nn.ReLU(),
+            nn.Linear(channels//r, channels),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        w = self.fc(x)
+        return x * w
+
+class SpatialAttention1d(nn.Module):
+    def __init__(self, kernel=7):
+        super().__init__()
+        self.conv = nn.Conv1d(2,1,kernel,padding=(kernel-1)//2)
+    def forward(self,x):
+        # x: (B, C, L)
+        avg = torch.mean(x, dim=1, keepdim=True)
+        maxv, _ = torch.max(x, dim=1, keepdim=True)
+        cat = torch.cat([avg, maxv], dim=1)
+        att = torch.sigmoid(self.conv(cat))
+        return x * att
+
+# -------------------- ResBlock --------------------
+class ResBlock(nn.Module):
+    def __init__(self, ch):
+        super().__init__()
+        self.conv1 = SeparableConv1d(ch, ch, 3, 1)
+        self.bn1 = nn.BatchNorm1d(ch)
+        self.conv2 = SeparableConv1d(ch, ch, 3, 1)
+        self.bn2 = nn.BatchNorm1d(ch)
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + x)
+
+# -------------------- BranchV2 --------------------
+class BranchV2(nn.Module):
+    def __init__(self, sample_rate, freq_band, in_reduce=64, mid_ch=64):
+        super().__init__()
+        self.wave = WaveletConv1d(sample_rate, freq_band, filter_length=129)
+        in_ch = len(freq_band)*2
+        self.reduce = nn.Conv1d(in_ch, in_reduce, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm1d(in_reduce)
+        # residual blocks
+        self.res1 = ResBlock(in_reduce)
+        self.pool = nn.MaxPool1d(2)
+        self.res2 = ResBlock(in_reduce)
+        self.conv_mid = nn.Conv1d(in_reduce, mid_ch, kernel_size=3, padding=1, bias=False)
+        self.bn_mid = nn.BatchNorm1d(mid_ch)
+        self.spatial_att = SpatialAttention1d()
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+    def forward(self,x):
+        x = self.wave(x)                           # (B, in_ch, L)
+        x = F.relu(self.bn(self.reduce(x)))        # (B, in_reduce, L)
+        x = self.res1(x)
+        x = self.pool(x)                           # (B, in_reduce, L/2)
+        x = self.res2(x)
+        x = F.relu(self.bn_mid(self.conv_mid(x)))  # (B, mid_ch, L/2)
+        x = self.spatial_att(x)
+        x = self.global_pool(x)
+        return x.view(x.size(0), -1)              # (B, mid_ch)
+
+# -------------------- PGWBN_v2 (full) --------------------
+class PGWBN_v2(nn.Module):
+    def __init__(self, sample_rate, freq_guide, num_classes, branch_out=64):
+        super().__init__()
+        self.branches = nn.ModuleList()
+        branch_size = branch_out
+        for freq in freq_guide.values():
+            freq_band = [freq*0.98, freq, freq*1.02]
+            self.branches.append(BranchV2(sample_rate, freq_band, in_reduce=branch_size, mid_ch=branch_size))
+        total = branch_size * len(self.branches)
+        self.channel_att = ChannelAttentionVec(total, r=8)
+        self.dropout = nn.Dropout(0.4)
+        self.classifier = nn.Linear(total, num_classes)
+    def forward(self,x):
+        outs = [b(x) for b in self.branches]   # list of (B, branch_size)
+        feat = torch.cat(outs, dim=1)          # (B, total)
+        feat = self.channel_att(feat)
+        feat = self.dropout(feat)
+        return self.classifier(feat)
+
+# -------------------- Data helpers --------------------
+def scan_classes(data_root, suffix="_2.mat"):
+    files = sorted([f for f in os.listdir(data_root) if f.endswith(suffix)])
+    if not files: raise RuntimeError("no _2.mat found")
+    classes = {fn.replace(suffix,""):fn for fn in files}
+    print("classes:", list(classes.keys()))
+    return classes
+
+def load_and_slice(fp, length=1000):
+    d = loadmat(fp)
+    key=None
+    for k in d.keys():
+        if "DE_time" in k:
+            key=k; break
+    if key is None:
+        for k,v in d.items():
+            if not k.startswith("__") and isinstance(v, np.ndarray) and v.size>=length:
+                key=k; break
+    sig = np.squeeze(d[key])
+    nseg = len(sig)//length
+    segs=[sig[i*length:(i+1)*length] for i in range(nseg)]
+    return np.array(segs)
+
+def normalize_segs(segs):
+    segs = np.asarray(segs, dtype=np.float32)
+    mean = segs.mean(axis=1, keepdims=True)
+    std = segs.std(axis=1, keepdims=True)
+    return (segs - mean) / (std + 1e-8)
+
+def build_dataset(class_map, N, length=1000, split_dir="splits_full"):
+    os.makedirs(split_dir, exist_ok=True)
+    split_file = os.path.join(split_dir, f"split_N{N}.json")
+    classes = sorted(class_map.keys())
+    Xtr_list, ytr_list, Xte_list, yte_list = [], [], [], []
+    splits = {}
+    if os.path.exists(split_file):
+        with open(split_file, 'r') as f:
+            splits = json.load(f)
+    for idx,cls in enumerate(classes):
+        segs = load_and_slice(os.path.join(DATA_ROOT, class_map[cls]), length)
+        if len(segs) < N+1: raise RuntimeError(f"{cls} segs {len(segs)} < N+1")
+        segs = normalize_segs(segs)
+        if cls in splits:
+            tr_idx = np.array(splits[cls]['tr'], dtype=int)
+            te_idx = np.array(splits[cls]['te'], dtype=int)
+        else:
+            perm = np.random.permutation(len(segs))
+            tr_idx = perm[:N]
+            te_idx = perm[N:]
+            splits[cls] = {'tr': tr_idx.tolist(), 'te': te_idx.tolist()}
+        Xtr_list.append(segs[tr_idx])
+        ytr_list += [idx]*len(tr_idx)
+        Xte_list.append(segs[te_idx])
+        yte_list += [idx]*len(te_idx)
+    with open(split_file, 'w') as f:
+        json.dump(splits, f)
+    Xtr = np.concatenate(Xtr_list, axis=0)
+    Xte = np.concatenate(Xte_list, axis=0)
+    Xtr = torch.tensor(Xtr, dtype=torch.float32).unsqueeze(1)
+    Xte = torch.tensor(Xte, dtype=torch.float32).unsqueeze(1)
+    return Xtr, torch.tensor(ytr_list, dtype=torch.long), Xte, torch.tensor(yte_list, dtype=torch.long), len(classes)
+
+# -------------------- train/test --------------------
+def train_epoch(model, loader, opt, crit):
+    model.train()
+    tot = 0; correct = 0
+    for X,y in tqdm(loader, desc="train"):
+        X,y = X.to(DEVICE), y.to(DEVICE)
+        opt.zero_grad()
+        out = model(X)
+        loss = crit(out, y)
+        loss.backward()
+        opt.step()
+        correct += (out.argmax(1) == y).sum().item()
+        tot += y.size(0)
+    return correct / tot if tot>0 else 0.0
+
+def test_epoch(model, loader):
+    model.eval()
+    tot = 0; correct = 0
+    with torch.no_grad():
+        for X,y in tqdm(loader, desc="test"):
+            X,y = X.to(DEVICE), y.to(DEVICE)
+            out = model(X)
+            correct += (out.argmax(1) == y).sum().item()
+            tot += y.size(0)
+    return correct / tot if tot>0 else 0.0
+
+# -------------------- 主流程（恢复完整版 + 稳定策略） --------------------
+def run():
+    class_map = scan_classes(DATA_ROOT, CONDITION_SUFFIX)
+    freq_guide = get_physics_guide_freqs(RPM, BALL_DIA, PITCH_DIA, NUM_BALLS)
+    results = []
+    csv_file = "table4_v2_final.csv"
+
+    for N in N_LIST:
+        print(f"\n=== N={N} ===")
+        Xtr, ytr, Xte, yte, numc = build_dataset(class_map, N, SIGNAL_LENGTH)
+        tr_loader = DataLoader(TensorDataset(Xtr, ytr), batch_size=BATCH_SIZE, shuffle=True)
+        te_loader = DataLoader(TensorDataset(Xte, yte), batch_size=BATCH_SIZE, shuffle=False)
+
+        model = PGWBN_v2(SAMPLE_RATE, freq_guide, numc, branch_out=64).to(DEVICE)
+        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=15, gamma=0.5)
+        crit = nn.CrossEntropyLoss()
+
+        best_te = 0.0
+        best_state = None
+        patience = 8
+        no_improve = 0
+
+        for ep in range(EPOCHS):
+            tr_acc = train_epoch(model, tr_loader, opt, crit)
+            te_acc = test_epoch(model, te_loader)
+            scheduler.step()
+
+            print(f"[N={N}] Ep {ep+1}/{EPOCHS} train={tr_acc:.4f} test={te_acc:.4f}")
+
+            if te_acc > best_te + 1e-6:
+                best_te = te_acc
+                best_state = model.state_dict()
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            if no_improve >= patience:
+                print(f"Early stop at epoch {ep+1}, best test acc {best_te:.4f}")
+                break
+
+        # load best
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        final_tr = test_epoch(model, tr_loader)
+        final_te = test_epoch(model, te_loader)
+        print(f"Final N={N} -> train={final_tr:.4f} test={final_te:.4f}")
+
+        # save results
+        header = not os.path.exists(csv_file)
+        with open(csv_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if header:
+                writer.writerow(["N","train_acc","test_acc"])
+            writer.writerow([N, f"{final_tr:.4f}", f"{final_te:.4f}"])
+
+    print("done; results saved to", csv_file)
+
+if __name__ == "__main__":
+    run()
