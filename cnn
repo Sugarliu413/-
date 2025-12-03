@@ -1,0 +1,137 @@
+# 基础版 CWRU 诊断脚本（最简消融版 + N列表设置）
+# 只保留：数据加载 + 简单CNN + 训练/测试循环
+# 用户可在此基础上逐步添加模块
+
+import os
+import numpy as np
+from scipy.io import loadmat
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import Adam
+from tqdm import tqdm
+
+# --------------------------- 配置 ---------------------------
+DATA_ROOT = './CWRU_data'
+SIGNAL_LENGTH = 1024  # 输入信号长度
+N_LIST = [1,5,10,20,30]  # 与原始代码保持一致
+EPOCHS = 50
+BATCH_SIZE = 16
+LR = 1e-3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --------------------------- 数据加载 ---------------------------
+
+def load_cwru(path=DATA_ROOT, length=SIGNAL_LENGTH):
+    X, Y = [], []
+    files = sorted([f for f in os.listdir(path) if f.endswith('_2.mat')])
+    class_names = [f.replace('_2.mat', '') for f in files]
+    label_map = {name: i for i, name in enumerate(class_names)}
+
+    for fname in files:
+        fpath = os.path.join(path, fname)
+        data = loadmat(fpath)
+        key = None
+        for k in data.keys():
+            if 'DE_time' in k:
+                key = k
+        if key is None:
+            continue
+        sig = data[key].reshape(-1)
+        total = len(sig) // length
+        sig = sig[: total * length].reshape(total, length)
+        cls = fname.replace('_2.mat', '')
+        X.append(sig)
+        Y.append(np.ones(total) * label_map[cls])
+
+    X = np.concatenate(X, axis=0)
+    Y = np.concatenate(Y, axis=0)
+    X = torch.tensor(X, dtype=torch.float32).unsqueeze(1)
+    Y = torch.tensor(Y, dtype=torch.long)
+    return X, Y
+
+# --------------------------- 最简单 CNN ---------------------------
+
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes, input_length=SIGNAL_LENGTH):
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, 16, 5, padding=2)
+        self.conv2 = nn.Conv1d(16, 32, 5, padding=2)
+        self.pool = nn.MaxPool1d(2)
+        l1 = input_length // 2
+        l2 = l1 // 2
+        self.flatten_size = l2 * 32
+        self.fc1 = nn.Linear(self.flatten_size, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.pool(torch.relu(self.conv1(x)))
+        x = self.pool(torch.relu(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# --------------------------- 训练与测试 ---------------------------
+
+def run_train(X, Y, N, epochs=EPOCHS, batch=BATCH_SIZE):
+    # 随机选取每类 N 个样本作为训练集，其余作为测试集
+    classes = torch.unique(Y)
+    train_idx, test_idx = [], []
+    for c in classes:
+        idx = (Y==c).nonzero(as_tuple=True)[0]
+        perm = torch.randperm(len(idx))
+        train_idx += idx[perm[:N]].tolist()
+        test_idx += idx[perm[N:]].tolist()
+
+    Xtr, Ytr = X[train_idx], Y[train_idx]
+    Xte, Yte = X[test_idx], Y[test_idx]
+
+    tr_loader = DataLoader(TensorDataset(Xtr, Ytr), batch_size=batch, shuffle=True)
+    te_loader = DataLoader(TensorDataset(Xte, Yte), batch_size=batch, shuffle=False)
+
+    model = SimpleCNN(num_classes=len(classes), input_length=SIGNAL_LENGTH).to(DEVICE)
+    opt = Adam(model.parameters(), lr=LR)
+    loss_fn = nn.CrossEntropyLoss()
+
+    best_acc = 0
+    for ep in range(epochs):
+        model.train()
+        total, correct = 0, 0
+        for x, y in tqdm(tr_loader, desc=f"N={N} Ep {ep+1}/{epochs}"):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            out = model(x)
+            loss = loss_fn(out, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            pred = out.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += len(y)
+        acc = correct / total
+        if acc > best_acc:
+            best_acc = acc
+        print(f"Epoch {ep+1}: train_acc={acc:.4f}")
+
+    # 测试集评估
+    model.eval()
+    total, correct = 0, 0
+    with torch.no_grad():
+        for x, y in te_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            out = model(x)
+            pred = out.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += len(y)
+    test_acc = correct / total
+    print(f"N={N} final test_acc={test_acc:.4f}")
+    return model
+
+# --------------------------- 主程序入口 ---------------------------
+if __name__ == '__main__':
+    X, Y = load_cwru(DATA_ROOT, length=SIGNAL_LENGTH)
+    print('数据加载完毕:', X.shape, Y.shape)
+
+    for N in N_LIST:
+        print(f"\n=== 开始训练 N={N} ===")
+        model = run_train(X, Y, N)
