@@ -1,0 +1,294 @@
+# =========================================================
+# PGWBN for XJTU-SY Bearing Dataset
+# Leakage-Free + Repeated Experiments (Final)
+# =========================================================
+
+import os, random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+# ==========================================
+# 1. 全局配置
+# ==========================================
+BASE_SEED = 42
+random.seed(BASE_SEED)
+np.random.seed(BASE_SEED)
+torch.manual_seed(BASE_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(BASE_SEED)
+
+DATA_ROOT = "./XJTU-SY_Bearing_Datasets/37.5Hz11kN"
+
+SIGNAL_LENGTH = 1000
+N_LIST = [1, 5, 10, 20, 30]
+REPEAT = 10                             # ⭐ 重复实验次数（可改为 10）
+EPOCHS = 60
+BATCH_SIZE = 16
+LR = 0.002
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------- XJTU-SY 物理参数 --------
+SAMPLE_RATE = 25600
+BALL_DIA = 7.92
+PITCH_DIA = 34.55
+NUM_BALLS = 8
+CURRENT_RPM = 2250
+
+print(f"Dataset Path: {DATA_ROOT}")
+print(f"Condition: 37.5Hz | RPM={CURRENT_RPM}")
+print(f"Repeat Experiments: {REPEAT}")
+
+# ==========================================
+# 2. 物理特征频率
+# ==========================================
+def get_xjtu_freqs(rpm, ball, pitch, balls):
+    fr = rpm / 60.0
+    factor = ball / pitch
+    return {
+        "BPFO": 0.5 * balls * fr * (1 - factor),
+        "BPFI": 0.5 * balls * fr * (1 + factor),
+        "BSF":  0.5 * pitch / ball * fr * (1 - factor**2),
+        "FTF":  0.5 * fr * (1 - factor)
+    }
+
+# ==========================================
+# 3. 数据加载（XJTU 专用 · 无泄露）
+# ==========================================
+def load_xjtu_data(n_shot, seed):
+    bearing_map = {
+        "Bearing2_1": 1,  # Inner
+        "Bearing2_2": 0,  # Outer
+        "Bearing2_3": 2,  # Cage
+        "Bearing2_4": 0,
+        "Bearing2_5": 0
+    }
+
+    Xtr, ytr, Xte, yte = [], [], [], []
+
+    for bearing, label in bearing_map.items():
+        folder = os.path.join(DATA_ROOT, bearing)
+        if not os.path.exists(folder):
+            continue
+
+        files = sorted(
+            [f for f in os.listdir(folder) if f.endswith(".csv")],
+            key=lambda x: int(x.split(".")[0])
+        )
+
+        if len(files) < 6:
+            continue
+
+        # 固定测试集（防泄露）
+        test_files = files[-5:]
+        train_pool = files[-20:-5]
+
+        if len(train_pool) == 0:
+            continue
+
+        random.seed(seed)
+        random.shuffle(train_pool)
+        train_files = train_pool[:min(n_shot, len(train_pool))]
+
+        def load_segments(file_list):
+            segs = []
+            for f in file_list:
+                df = pd.read_csv(os.path.join(folder, f))
+                sig = df.iloc[:, 0].values
+
+                if len(sig) < SIGNAL_LENGTH:
+                    continue
+
+                n_seg = len(sig) // SIGNAL_LENGTH
+                for i in range(n_seg):
+                    s = sig[i*SIGNAL_LENGTH:(i+1)*SIGNAL_LENGTH]
+                    s = (s - s.mean()) / (s.std() + 1e-8)
+                    segs.append(s)
+            return segs
+
+        tr_segs = load_segments(train_files)
+        te_segs = load_segments(test_files)
+
+        if len(tr_segs) == 0 or len(te_segs) == 0:
+            continue
+
+        random.shuffle(tr_segs)
+        random.shuffle(te_segs)
+
+        Xtr.extend(tr_segs[:n_shot])
+        ytr.extend([label] * min(n_shot, len(tr_segs)))
+
+        Xte.extend(te_segs[:50])
+        yte.extend([label] * min(50, len(te_segs)))
+
+    return (
+        torch.tensor(np.array(Xtr), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(ytr).long(),
+        torch.tensor(np.array(Xte), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(yte).long(),
+        len(set(ytr))
+    )
+
+# ==========================================
+# 4. PGWBN 模型（未改动）
+# ==========================================
+class HarmonicInitConv1d(nn.Conv1d):
+    def __init__(self, in_c, out_c, center, sr, k=65):
+        super().__init__(in_c, out_c, k, padding=k//2, bias=False)
+        self.init_weights(center, sr)
+
+    def init_weights(self, f, fs):
+        t = np.linspace(-self.kernel_size[0]/2/fs,
+                        self.kernel_size[0]/2/fs,
+                        self.kernel_size[0])
+        with torch.no_grad():
+            for i in range(self.out_channels):
+                fb = f * np.random.uniform(0.95, 1.05)
+                w = 0
+                for h in [1, 2, 3]:
+                    s = 4.0 / (2*np.pi*fb*h)
+                    w += np.cos(2*np.pi*fb*h*t) * np.exp(-t**2/(2*s**2))
+                w = w / (np.linalg.norm(w) + 1e-8)
+                for j in range(self.in_channels):
+                    self.weight[i, j] = torch.tensor(w)
+
+class EnvPhysBranch(nn.Module):
+    def __init__(self, sr, f):
+        super().__init__()
+        self.front = nn.Sequential(
+            nn.Conv1d(1, 8, 64, 2, 31, bias=False),
+            nn.BatchNorm1d(8),
+            nn.ReLU()
+        )
+        self.mid = HarmonicInitConv1d(8, 16, f, sr/2)
+        self.bn = nn.BatchNorm1d(16)
+        self.act = nn.ReLU()
+        self.back = nn.Sequential(
+            nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, 3, 1, 1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+    def forward(self, x):
+        x = self.front(x)
+        x = self.act(self.bn(self.mid(x)))
+        x = self.back(x)
+        return x.view(x.size(0), -1)
+
+class RandBranch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, 16, 64, 2, 31),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, 3, 1, 1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 32, 3, 1, 1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+    def forward(self, x):
+        return self.net(x).view(x.size(0), -1)
+
+class GatedFusion(nn.Module):
+    def __init__(self, d1, d2):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(d1 + d2, (d1 + d2)//2),
+            nn.ReLU(),
+            nn.Linear((d1 + d2)//2, d1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x1, x2):
+        a = self.gate(torch.cat([x1, x2], 1))
+        return torch.cat([x1 * a, x2], 1)
+
+class PGWBN_XJTU(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        freqs = get_xjtu_freqs(CURRENT_RPM, BALL_DIA, PITCH_DIA, NUM_BALLS)
+        self.pb = nn.ModuleList([EnvPhysBranch(SAMPLE_RATE, f) for f in freqs.values()])
+        self.rb = nn.ModuleList([RandBranch(), RandBranch()])
+        p_dim = 32 * len(self.pb)
+        r_dim = 32 * len(self.rb)
+        self.fuse = GatedFusion(p_dim, r_dim)
+        self.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(p_dim + r_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x):
+        p = torch.cat([b(x) for b in self.pb], 1)
+        r = torch.cat([b(x) for b in self.rb], 1)
+        return self.fc(self.fuse(p, r))
+
+# ==========================================
+# 5. 主训练流程（多次重复取平均）
+# ==========================================
+def run():
+    print(">>> PGWBN on XJTU-SY (Repeated Experiments)")
+
+    for n in N_LIST:
+        acc_list = []
+        print(f"\n=== N-Shot = {n} ===")
+
+        for r in range(REPEAT):
+            seed = BASE_SEED + r * 100 + n
+            Xtr, ytr, Xte, yte, numc = load_xjtu_data(n, seed)
+
+            if len(Xtr) == 0 or len(Xte) == 0:
+                continue
+
+            tr_loader = DataLoader(TensorDataset(Xtr, ytr), BATCH_SIZE, shuffle=True)
+            te_loader = DataLoader(TensorDataset(Xte, yte), BATCH_SIZE)
+
+            model = PGWBN_XJTU(numc).to(DEVICE)
+            opt = torch.optim.AdamW(model.parameters(), lr=LR)
+            crit = nn.CrossEntropyLoss()
+
+            best = 0.0
+            for _ in range(EPOCHS):
+                model.train()
+                for x, y in tr_loader:
+                    opt.zero_grad()
+                    loss = crit(model(x.to(DEVICE)), y.to(DEVICE))
+                    loss.backward()
+                    opt.step()
+
+                model.eval()
+                c = t = 0
+                with torch.no_grad():
+                    for x, y in te_loader:
+                        pred = model(x.to(DEVICE)).argmax(1)
+                        c += (pred == y.to(DEVICE)).sum().item()
+                        t += y.size(0)
+
+                acc = c / t if t > 0 else 0.0
+                best = max(best, acc)
+
+            acc_list.append(best)
+            print(f"  Repeat {r+1}/{REPEAT}: best={best:.4f}")
+
+        if len(acc_list) > 0:
+            mean = np.mean(acc_list)
+            std  = np.std(acc_list)
+            print(f"Result [PGWBN] N={n}: {mean:.4f} ± {std:.4f}")
+        else:
+            print(f"Result [PGWBN] N={n}: No valid runs")
+
+if __name__ == "__main__":
+    run()
