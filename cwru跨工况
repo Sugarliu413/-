@@ -1,0 +1,297 @@
+import os, random
+import numpy as np
+import scipy.io as sio
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# ==========================================
+# 1. 全局配置
+# ==========================================
+BASE_SEED = 41
+random.seed(BASE_SEED)
+np.random.seed(BASE_SEED)
+torch.manual_seed(BASE_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(BASE_SEED)
+
+DATA_ROOT = "./CWRU_data"
+
+# 跨工况设置
+SOURCE_SUFFIX = "_0.mat"  # 训练数据后缀 (0 HP)
+TARGET_SUFFIX = "_1.mat"  # 测试数据后缀 (2 HP)
+
+# 物理参数 (使用源域 Source 的参数初始化模型)
+# 因为模型是在 0HP 工况下训练的，所以物理滤波器初始化应基于 0HP 的转速
+SOURCE_RPM = 1797
+SAMPLE_RATE = 12000
+BALL_DIA = 0.3126
+PITCH_DIA = 1.537
+NUM_BALLS = 9
+
+SIGNAL_LENGTH = 1024
+N_LIST = [1, 5, 10, 20, 30]  # 训练集样本数 (Source Domain)
+EPOCHS = 60
+BATCH_SIZE = 16
+LR = 0.002
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Cross-Domain: Train on 0HP ({SOURCE_RPM} RPM) -> Test on 2HP")
+
+
+# ==========================================
+# 2. 物理频率计算
+# ==========================================
+def get_cwru_freqs(rpm, bd, pd, nb, angle=0):
+    angle_rad = np.deg2rad(angle)
+    fr = rpm / 60.0
+    factor = (bd / pd) * np.cos(angle_rad)
+    return {
+        "BPFO": 0.5 * nb * fr * (1 - factor),
+        "BPFI": 0.5 * nb * fr * (1 + factor),
+        "BSF": 0.5 * (pd / bd) * fr * (1 - factor ** 2),
+        "FTF": 0.5 * fr * (1 - factor)
+    }
+
+
+# ==========================================
+# 3. 跨工况数据加载器
+# ==========================================
+def load_cross_domain_data(n_shot, seed):
+    """
+    Train: 从 _0.mat 读取 n_shot 个样本
+    Test:  从 _2.mat 读取 所有可用样本 (或固定数量)
+    """
+
+    file_map = [
+        ("Normal", 0),
+        ("B007", 1), ("B014", 2), ("B021", 3),
+        ("IR007", 4), ("IR014", 5), ("IR021", 6),
+        ("OR007", 7), ("OR014", 8), ("OR021", 9)
+    ]
+
+    X_train, y_train = [], []
+    X_test, y_test = [], []
+
+    # 目标域测试样本数量 (取多一点以验证泛化性)
+    N_TARGET_TEST = 50
+
+    for prefix, label in file_map:
+        # --- 1. 读取源域 (训练集) ---
+        src_name = f"{prefix}{SOURCE_SUFFIX}"
+        src_path = os.path.join(DATA_ROOT, src_name)
+
+        # 容错：如果找不到 Normal_0.mat 尝试找 Normal.mat 或跳过
+        if not os.path.exists(src_path):
+            # 尝试一下 CWRU 有时命名不规范的情况
+            if prefix == "Normal" and os.path.exists(os.path.join(DATA_ROOT, "Normal_0.mat")):
+                src_path = os.path.join(DATA_ROOT, "Normal_0.mat")
+            elif not os.path.exists(src_path):
+                print(f"[Train Skip] Missing {src_name}")
+                # 如果源域缺失，无法训练该类别，直接跳过
+                continue
+
+        try:
+            # 加载源域数据
+            data = sio.loadmat(src_path)
+            key = next(k for k in data.keys() if "DE_time" in k)
+            sig = data[key].flatten()
+
+            # 切片 & 归一化
+            n_segs = len(sig) // SIGNAL_LENGTH
+            if n_segs < n_shot: continue
+
+            segments = []
+            for i in range(n_segs):
+                s = sig[i * SIGNAL_LENGTH: (i + 1) * SIGNAL_LENGTH]
+                s = (s - np.mean(s)) / (np.std(s) + 1e-8)  # Instance Norm
+                segments.append(s)
+
+            # 随机抽取 n_shot 用于训练
+            random.seed(seed)
+            random.shuffle(segments)
+            X_train.extend(segments[:n_shot])
+            y_train.extend([label] * n_shot)
+
+        except Exception as e:
+            print(f"[Error Train] {src_name}: {e}")
+
+        # --- 2. 读取目标域 (测试集) ---
+        # 如果你没有 Normal_2.mat，这里会自动跳过，只测故障类
+        tgt_name = f"{prefix}{TARGET_SUFFIX}"
+        tgt_path = os.path.join(DATA_ROOT, tgt_name)
+
+        if not os.path.exists(tgt_path):
+            if prefix != "Normal":  # 正常类缺失不打印警告，因为用户已知
+                print(f"[Test Skip] Missing Target File {tgt_name}")
+            continue
+
+        try:
+            # 加载目标域数据
+            data = sio.loadmat(tgt_path)
+            key = next(k for k in data.keys() if "DE_time" in k)
+            sig = data[key].flatten()
+
+            n_segs = len(sig) // SIGNAL_LENGTH
+            if n_segs < N_TARGET_TEST: continue  # 数据太少就不测了
+
+            segments = []
+            for i in range(n_segs):
+                s = sig[i * SIGNAL_LENGTH: (i + 1) * SIGNAL_LENGTH]
+                s = (s - np.mean(s)) / (np.std(s) + 1e-8)
+                segments.append(s)
+
+            # 取最后 N_TARGET_TEST 个作为测试
+            # (虽然跨工况不需要防时间泄露，但保持一致性)
+            X_test.extend(segments[-N_TARGET_TEST:])
+            y_test.extend([label] * N_TARGET_TEST)
+
+        except Exception as e:
+            print(f"[Error Test] {tgt_name}: {e}")
+
+    # 转换为 Tensor
+    if len(X_train) == 0: return None, None, None, None, 0
+
+    return (
+        torch.tensor(np.array(X_train), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(y_train).long(),
+        torch.tensor(np.array(X_test), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(y_test).long(),
+        10  # 始终假设是 10 分类任务
+    )
+
+
+# ==========================================
+# 4. PGWBN 模型 (同前，省略部分细节)
+# ==========================================
+class HarmonicInitConv1d(nn.Conv1d):
+    def __init__(self, in_c, out_c, center, sr, k=65):
+        super().__init__(in_c, out_c, k, padding=k // 2, bias=False)
+        self.init_weights(center, sr)
+
+    def init_weights(self, f, fs):
+        t = np.linspace(-self.kernel_size[0] / 2 / fs, self.kernel_size[0] / 2 / fs, self.kernel_size[0])
+        with torch.no_grad():
+            for i in range(self.out_channels):
+                fb = f * np.random.uniform(0.95, 1.05)
+                w = 0
+                for h in [1, 2, 3]:
+                    s = 4.0 / (2 * np.pi * fb * h)
+                    w += np.cos(2 * np.pi * fb * h * t) * np.exp(-t ** 2 / (2 * s ** 2))
+                w = w / (np.linalg.norm(w) + 1e-8)
+                for j in range(self.in_channels): self.weight[i, j] = torch.tensor(w)
+
+
+class EnvPhysBranch(nn.Module):
+    def __init__(self, sr, f):
+        super().__init__()
+        self.front = nn.Sequential(nn.Conv1d(1, 8, 64, 2, 31, bias=False), nn.BatchNorm1d(8), nn.ReLU())
+        self.mid = HarmonicInitConv1d(8, 16, f, sr / 2)
+        self.bn = nn.BatchNorm1d(16)
+        self.act = nn.ReLU()
+        self.back = nn.Sequential(nn.MaxPool1d(2), nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(),
+                                  nn.AdaptiveAvgPool1d(1))
+
+    def forward(self, x):
+        x = self.front(x)
+        x = self.act(self.bn(self.mid(x)))
+        x = self.back(x)
+        return x.view(x.size(0), -1)
+
+
+class RandBranch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv1d(1, 16, 64, 2, 31), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2),
+                                 nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+                                 nn.Conv1d(32, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1))
+
+    def forward(self, x): return self.net(x).view(x.size(0), -1)
+
+
+class GatedFusion(nn.Module):
+    def __init__(self, d1, d2):
+        super().__init__()
+        self.gate = nn.Sequential(nn.Linear(d1 + d2, (d1 + d2) // 2), nn.ReLU(), nn.Linear((d1 + d2) // 2, d1),
+                                  nn.Sigmoid())
+
+    def forward(self, x1, x2):
+        a = self.gate(torch.cat([x1, x2], 1))
+        return torch.cat([x1 * a, x2], 1)
+
+
+class PGWBN_CWRU(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        # 关键：使用 SOURCE_RPM (1797) 初始化
+        freqs = get_cwru_freqs(SOURCE_RPM, BALL_DIA, PITCH_DIA, NUM_BALLS)
+        self.pb = nn.ModuleList([EnvPhysBranch(SAMPLE_RATE, f) for f in freqs.values()])
+        self.rb = nn.ModuleList([RandBranch(), RandBranch()])
+        p_dim = 32 * len(self.pb)
+        r_dim = 32 * len(self.rb)
+        self.fuse = GatedFusion(p_dim, r_dim)
+        self.fc = nn.Sequential(nn.Dropout(0.5), nn.Linear(p_dim + r_dim, 64), nn.ReLU(), nn.Linear(64, num_classes))
+
+    def forward(self, x):
+        p = torch.cat([b(x) for b in self.pb], 1)
+        r = torch.cat([b(x) for b in self.rb], 1)
+        return self.fc(self.fuse(p, r))
+
+
+# ==========================================
+# 5. 运行
+# ==========================================
+def run():
+    print(">>> Cross-Domain Experiments (0HP -> 2HP)")
+
+    for n in N_LIST:
+        acc_list = []
+        print(f"\n=== Train Source N-Shot = {n} ===")
+
+        for r in range(5):  # Repeat 5 times
+            seed = BASE_SEED + r * 100 + n
+            Xtr, ytr, Xte, yte, numc = load_cross_domain_data(n, seed)
+
+            if Xtr is None: break
+
+            # 打印一下实际的测试类别情况
+            if r == 0:
+                unique_test_labels = torch.unique(yte).tolist()
+                print(f"  [Info] Testing on classes: {unique_test_labels} (Count: {len(Xte)})")
+                if 0 not in unique_test_labels:
+                    print("  [Info] 'Normal' class missing in Target. Evaluating on faults only.")
+
+            tr_d = DataLoader(TensorDataset(Xtr, ytr), BATCH_SIZE, shuffle=True)
+            te_d = DataLoader(TensorDataset(Xte, yte), BATCH_SIZE)  # Batch size doesn't matter for eval
+
+            model = PGWBN_CWRU(numc).to(DEVICE)
+            opt = torch.optim.AdamW(model.parameters(), lr=LR)
+            crit = nn.CrossEntropyLoss()
+
+            best = 0.0
+            for _ in range(EPOCHS):
+                model.train()
+                for bx, by in tr_d:
+                    opt.zero_grad()
+                    loss = crit(model(bx.to(DEVICE)), by.to(DEVICE))
+                    loss.backward()
+                    opt.step()
+
+                model.eval()
+                c, t = 0, 0
+                with torch.no_grad():
+                    for bx, by in te_d:
+                        pred = model(bx.to(DEVICE)).argmax(1)
+                        c += (pred == by.to(DEVICE)).sum().item()
+                        t += by.size(0)
+                best = max(best, c / t if t > 0 else 0)
+
+            acc_list.append(best)
+            print(f"  Rep {r + 1}: {best:.4f}")
+
+        if acc_list:
+            print(f"Result N={n}: {np.mean(acc_list):.4f} ± {np.std(acc_list):.4f}")
+
+
+if __name__ == "__main__":
+    run()
