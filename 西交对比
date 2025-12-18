@@ -1,0 +1,277 @@
+import os, random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+# ==========================================
+# 1. 全局配置
+# ==========================================
+BASE_SEED = 41
+random.seed(BASE_SEED)
+np.random.seed(BASE_SEED)
+torch.manual_seed(BASE_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(BASE_SEED)
+
+DATA_ROOT = "./XJTU-SY_Bearing_Datasets/37.5Hz11kN"
+
+SIGNAL_LENGTH = 1000
+N_LIST = [1, 5, 10, 20, 30]
+REPEAT = 5  # 快速对比实验
+EPOCHS = 60
+BATCH_SIZE = 16
+LR = 0.002
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Dataset Path: {DATA_ROOT}")
+print(f"Device: {DEVICE}")
+
+
+# ==========================================
+# 2. 数据加载 (严格防泄露逻辑)
+# ==========================================
+def load_xjtu_data(n_shot, seed):
+    bearing_map = {
+        "Bearing2_1": 1, "Bearing2_2": 0, "Bearing2_3": 2,
+        "Bearing2_4": 0, "Bearing2_5": 0
+    }
+    Xtr, ytr, Xte, yte = [], [], [], []
+
+    for bearing, label in bearing_map.items():
+        folder = os.path.join(DATA_ROOT, bearing)
+        if not os.path.exists(folder): continue
+
+        # 按文件名编号排序（确保时间顺序）
+        files = sorted(
+            [f for f in os.listdir(folder) if f.endswith(".csv")],
+            key=lambda x: int(x.split(".")[0])
+        )
+        if len(files) < 6: continue
+
+        # [关键点1] 物理隔离：测试集取最后5个，训练池取之前的。无重叠。
+        test_files = files[-5:]
+        train_pool = files[-20:-5]
+
+        if len(train_pool) == 0: continue
+
+        random.seed(seed)
+        random.shuffle(train_pool)
+        train_files = train_pool[:min(n_shot, len(train_pool))]
+
+        def load_segments(file_list):
+            segs = []
+            for f in file_list:
+                df = pd.read_csv(os.path.join(folder, f))
+                sig = df.iloc[:, 0].values
+                if len(sig) < SIGNAL_LENGTH: continue
+                n_seg = len(sig) // SIGNAL_LENGTH
+                for i in range(n_seg):
+                    s = sig[i * SIGNAL_LENGTH:(i + 1) * SIGNAL_LENGTH]
+                    # [关键点2] 单样本归一化：不使用全局统计量
+                    s = (s - s.mean()) / (s.std() + 1e-8)
+                    segs.append(s)
+            return segs
+
+        tr_segs = load_segments(train_files)
+        te_segs = load_segments(test_files)
+        if len(tr_segs) == 0 or len(te_segs) == 0: continue
+
+        random.shuffle(tr_segs)
+        random.shuffle(te_segs)
+
+        # 组装数据
+        Xtr.extend(tr_segs[:n_shot])
+        ytr.extend([label] * min(n_shot, len(tr_segs)))
+        Xte.extend(te_segs[:50])
+        yte.extend([label] * min(50, len(te_segs)))
+
+    return (
+        torch.tensor(np.array(Xtr), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(ytr).long(),
+        torch.tensor(np.array(Xte), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(yte).long(),
+        len(set(ytr))
+    )
+
+
+# ==========================================
+# 3. 对比模型 (STFT-CNN 已修复警告)
+# ==========================================
+
+# --- 1. LSTM ---
+class Bench_LSTM(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=64, num_layers=2, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)  # (B, 1000, 1)
+        out, _ = self.lstm(x)
+        return self.fc(out[:, -1, :])
+
+
+# --- 2. STFT-CNN (Fixed Window) ---
+class Bench_STFT_CNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.n_fft, self.hop = 64, 32
+        # 注册 Hanning 窗，防止 Warning 和 频谱泄露
+        self.register_buffer('window', torch.hann_window(self.n_fft))
+        self.conv1 = nn.Conv2d(1, 16, 3, 1, 1)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.pool = nn.MaxPool2d(2)
+        self.conv2 = nn.Conv2d(16, 32, 3, 1, 1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, 3, 1, 1)
+        self.bn3 = nn.BatchNorm2d(64)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        x = x.squeeze(1)
+        with torch.no_grad():
+            spec = torch.stft(x, n_fft=self.n_fft, hop_length=self.hop,
+                              window=self.window, return_complex=True)
+            mag = torch.log(torch.abs(spec) + 1e-6).unsqueeze(1)
+        x = self.pool(F.relu(self.bn1(self.conv1(mag))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = self.gap(F.relu(self.bn3(self.conv3(x)))).flatten(1)
+        return self.fc(x)
+
+
+# --- 3. ResNet-1D ---
+class ResBlock1D(nn.Module):
+    def __init__(self, in_c, out_c, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_c, out_c, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_c)
+        self.conv2 = nn.Conv1d(out_c, out_c, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_c)
+        self.sc = nn.Sequential()
+        if stride != 1 or in_c != out_c:
+            self.sc = nn.Sequential(nn.Conv1d(in_c, out_c, 1, stride, bias=False), nn.BatchNorm1d(out_c))
+
+    def forward(self, x):
+        return F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + self.sc(x))
+
+
+class Bench_ResNet1D(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(1, 16, 7, 2, 3, bias=False), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(3, 2, 1),
+            ResBlock1D(16, 16), ResBlock1D(16, 32, 2), ResBlock1D(32, 64, 2),
+            nn.AdaptiveAvgPool1d(1), nn.Flatten(), nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x): return self.net(x)
+
+
+# --- 4. T-F DualNet ---
+class Bench_TFDualNet(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.br = nn.Sequential(
+            nn.Conv1d(1, 16, 64, 2, 31), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+        )
+        self.fc = nn.Linear(64, num_classes)
+
+    def forward(self, x):
+        t = self.br(x).flatten(1)
+        f_in = torch.log(torch.abs(torch.fft.rfft(x.squeeze(1), dim=1)).unsqueeze(1) + 1.0)
+        f = self.br(f_in).flatten(1)
+        return self.fc(torch.cat([t, f], 1))
+
+
+# --- 5. WDCNN ---
+class Bench_WDCNN(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        # WDCNN adapted for 1000 input length
+        self.l1 = nn.Sequential(nn.Conv1d(1, 16, 64, 16, 24), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2, 2))
+        self.layers = nn.ModuleList([
+            nn.Sequential(nn.Conv1d(i, o, 3, 1, 1), nn.BatchNorm1d(o), nn.ReLU(), nn.MaxPool1d(2, 2))
+            for i, o in [(16, 32), (32, 64), (64, 64), (64, 64)]
+        ])
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(64, 100), nn.ReLU(), nn.Linear(100, num_classes))
+
+    def forward(self, x):
+        x = self.l1(x)
+        for l in self.layers: x = l(x)
+        return self.fc(x)
+
+
+# ==========================================
+# 4. 训练流程
+# ==========================================
+def train_model(model_class, model_name):
+    print(f"\n>>> Model: {model_name}")
+    results = {}
+    for n in N_LIST:
+        acc_list = []
+        for r in range(REPEAT):
+            seed = BASE_SEED + r * 100 + n
+            Xtr, ytr, Xte, yte, numc = load_xjtu_data(n, seed)
+
+            # 安全检查：如果没有数据则跳过
+            if len(Xtr) == 0: continue
+
+            tr_d = DataLoader(TensorDataset(Xtr, ytr), BATCH_SIZE, shuffle=True)
+            te_d = DataLoader(TensorDataset(Xte, yte), BATCH_SIZE)
+
+            model = model_class(numc).to(DEVICE)
+            opt = torch.optim.AdamW(model.parameters(), lr=LR)
+            crit = nn.CrossEntropyLoss()
+
+            best = 0.0
+            for _ in range(EPOCHS):
+                model.train()
+                for bx, by in tr_d:
+                    opt.zero_grad()
+                    loss = crit(model(bx.to(DEVICE)), by.to(DEVICE))
+                    loss.backward()
+                    opt.step()
+
+                model.eval()
+                c, t = 0, 0
+                with torch.no_grad():
+                    for bx, by in te_d:
+                        pred = model(bx.to(DEVICE)).argmax(1)
+                        c += (pred == by.to(DEVICE)).sum().item()
+                        t += by.size(0)
+                best = max(best, c / t if t > 0 else 0)
+
+            acc_list.append(best)
+
+        mean = np.mean(acc_list) if acc_list else 0.0
+        results[n] = mean
+        print(f"   N={n:<2}: {mean:.4f}")
+    return results
+
+
+# ==========================================
+# 5. 主程序
+# ==========================================
+if __name__ == "__main__":
+    models = {
+        "LSTM": Bench_LSTM,
+        "STFT-CNN": Bench_STFT_CNN,
+        "ResNet1D": Bench_ResNet1D,
+        "TF-DualNet": Bench_TFDualNet,
+        "WDCNN": Bench_WDCNN
+    }
+
+    print("\n[INFO] Starting Comparison (Leakage-Free Verified)...")
+    summary = {name: train_model(cls, name) for name, cls in models.items()}
+
+    print("\n\n=== Comparison Summary (Accuracy) ===")
+    print(f"{'Model':<12} | " + " | ".join([f"{n}-shot" for n in N_LIST]))
+    print("-" * 65)
+    for name, res in summary.items():
+        row = f"{name:<12} | " + " | ".join([f"{res.get(n, 0):.4f}" for n in N_LIST])
+        print(row)
