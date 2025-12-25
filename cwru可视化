@@ -1,0 +1,298 @@
+import os
+import random
+import numpy as np
+import pandas as pd  # 确保导入pandas
+import scipy.io as sio
+import scipy.fftpack as fftpack
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix
+
+# ==========================================
+# 1. 配置与环境
+# ==========================================
+DATA_ROOT = "./CWRU_data"  # ⚠️ 请确认数据都在这里
+SRC_LOAD = 3  # 源域工况
+TGT_LOAD = 1  # 目标域工况
+N_SHOT = 10  # 训练样本数
+EPOCHS = 30  # 训练轮数
+BATCH_SIZE = 32
+LR = 0.002
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BASE_SEED = 42
+
+# 设置绘图风格
+sns.set(style="whitegrid", context="notebook")
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+# CWRU 参数
+SAMPLE_RATE = 12000
+SIGNAL_LENGTH = 1024
+LOAD_CONFIGS = {
+    0: {"suffix": "_0.mat", "rpm": 1797},
+    1: {"suffix": "_1.mat", "rpm": 1772},
+    2: {"suffix": "_2.mat", "rpm": 1750},
+    3: {"suffix": "_3.mat", "rpm": 1730}
+}
+BALL_DIA = 0.3126;
+PITCH_DIA = 1.537;
+NUM_BALLS = 9
+
+
+def set_seed(seed):
+    random.seed(seed);
+    np.random.seed(seed);
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+
+set_seed(BASE_SEED)
+
+
+# ==========================================
+# 2. 物理频率计算
+# ==========================================
+def get_cwru_freqs(rpm, bd, pd, nb, angle=0):
+    fr = rpm / 60.0
+    factor = (bd / pd) * np.cos(np.deg2rad(angle))
+    return {
+        "BPFO": 0.5 * nb * fr * (1 - factor),
+        "BPFI": 0.5 * nb * fr * (1 + factor),
+        "BSF": 0.5 * (pd / bd) * fr * (1 - factor ** 2),
+        "FTF": 0.5 * fr * (1 - factor)
+    }
+
+
+# ==========================================
+# 3. 数据加载逻辑
+# ==========================================
+def load_data(src, tgt, n_shot):
+    file_map = [("Normal", 0), ("B007", 1), ("B014", 2), ("B021", 3),
+                ("IR007", 4), ("IR014", 5), ("IR021", 6),
+                ("OR007", 7), ("OR014", 8), ("OR021", 9)]
+
+    def read_files(load_idx, is_train, prefix):
+        cfg = LOAD_CONFIGS[load_idx]
+        fpath = os.path.join(DATA_ROOT, f"{prefix}{cfg['suffix']}")
+        if not os.path.exists(fpath) and prefix == "Normal":
+            for bk in ["Normal_0.mat", "Normal_1.mat", "Normal_2.mat", "Normal_3.mat"]:
+                if os.path.exists(os.path.join(DATA_ROOT, bk)): fpath = os.path.join(DATA_ROOT, bk); break
+
+        if not os.path.exists(fpath): return []
+        try:
+            data = sio.loadmat(fpath)
+            key = next(k for k in data.keys() if "DE_time" in k)
+            sig = data[key].flatten()
+            segs = []
+            for i in range(len(sig) // SIGNAL_LENGTH):
+                s = sig[i * SIGNAL_LENGTH:(i + 1) * SIGNAL_LENGTH]
+                s = (s - np.mean(s)) / (np.std(s) + 1e-8)
+                segs.append(s)
+
+            if is_train:
+                random.shuffle(segs)
+                return segs[:n_shot]
+            else:
+                return segs[-50:]
+        except:
+            return []
+
+    X_src, y_src, X_tgt, y_tgt = [], [], [], []
+    for prefix, label in file_map:
+        s_data = read_files(src, True, prefix)
+        t_data = read_files(tgt, False, prefix)
+        X_src.extend(s_data);
+        y_src.extend([label] * len(s_data))
+        X_tgt.extend(t_data);
+        y_tgt.extend([label] * len(t_data))
+
+    if len(X_src) == 0: return None
+    to_t = lambda x: torch.tensor(np.array(x), dtype=torch.float32).unsqueeze(1)
+    to_l = lambda x: torch.tensor(x).long()
+    return to_t(X_src), to_l(y_src), to_t(X_tgt), to_l(y_tgt)
+
+
+# ==========================================
+# 4. PGWBN 模型定义
+# ==========================================
+class HarmonicInitConv1d(nn.Conv1d):
+    def __init__(self, in_c, out_c, center, sr, k=65):
+        super().__init__(in_c, out_c, k, padding=k // 2, bias=False)
+        t = np.linspace(-k / 2 / sr, k / 2 / sr, k)
+        with torch.no_grad():
+            for i in range(out_c):
+                fb = center * np.random.uniform(0.95, 1.05)
+                w = np.sum(
+                    [np.cos(2 * np.pi * fb * h * t) * np.exp(-t ** 2 / (2 * (4 / (2 * np.pi * fb * h)) ** 2)) for h in
+                     [1, 2, 3]], axis=0)
+                w = w / (np.linalg.norm(w) + 1e-8)
+                self.weight[i, :] = torch.tensor(w)
+
+
+class PGWBN(nn.Module):
+    def __init__(self, num_classes, rpm):
+        super().__init__()
+        freqs = get_cwru_freqs(rpm, BALL_DIA, PITCH_DIA, NUM_BALLS)
+
+        self.pb = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 8, 64, 2, 31, bias=False), nn.BatchNorm1d(8), nn.ReLU(),
+                HarmonicInitConv1d(8, 16, f, SAMPLE_RATE / 2),
+                nn.BatchNorm1d(16), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+            ) for f in freqs.values()
+        ])
+
+        self.rb = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 16, 64, 2, 31), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2),
+                nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+                nn.Conv1d(32, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+            ) for _ in range(2)
+        ])
+
+        self.p_dim = 32 * len(self.pb)
+        self.total_dim = self.p_dim + 32 * len(self.rb)  # 192
+
+        self.fuse = nn.Sequential(
+            nn.Linear(self.total_dim, self.total_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.total_dim // 2, self.p_dim),
+            nn.Sigmoid()
+        )
+
+        self.clf = nn.Sequential(nn.Dropout(0.5), nn.Linear(self.total_dim, 64), nn.ReLU(), nn.Linear(64, num_classes))
+
+    def forward(self, x, return_feat=False):
+        p_list = [b(x).view(x.size(0), -1) for b in self.pb]
+        r_list = [b(x).view(x.size(0), -1) for b in self.rb]
+        p = torch.cat(p_list, 1)
+        r = torch.cat(r_list, 1)
+
+        gate = self.fuse(torch.cat([p, r], 1))
+        feat = torch.cat([p * gate, r], 1)
+
+        out = self.clf(feat)
+        if return_feat: return out, feat
+        return out
+
+
+# ==========================================
+# 5. 可视化核心函数 (已修复 Label 报错问题)
+# ==========================================
+def plot_physics_filters(model):
+    print("正在生成物理滤波器可视化图...")
+    layer = model.pb[0][3]
+    weights = layer.weight.detach().cpu().numpy()
+    k_size = weights.shape[2]
+    fig, axes = plt.subplots(3, 2, figsize=(10, 8))
+    fig.suptitle("Interpretability: Physics-Guided Wavelet Filters", fontsize=15)
+    t = np.linspace(0, k_size / SAMPLE_RATE, k_size)
+    xf = np.linspace(0, SAMPLE_RATE / 2, k_size // 2)
+    for i in range(3):
+        w = weights[i, 0, :]
+        axes[i, 0].plot(t, w, color='#1f77b4');
+        axes[i, 0].set_title(f"Filter {i + 1} (Time Domain)");
+        axes[i, 0].grid(True, alpha=0.3)
+        yf = fftpack.fft(w)
+        axes[i, 1].plot(xf, 2.0 / k_size * np.abs(yf[:k_size // 2]), color='#ff7f0e');
+        axes[i, 1].set_title(f"Filter {i + 1} (Freq Domain)");
+        axes[i, 1].grid(True, alpha=0.3)
+    plt.tight_layout();
+    plt.show()
+
+
+def plot_tsne(model, Xs, ys, Xt, yt):
+    print("正在生成 t-SNE 特征分布图...")
+    model.eval()
+    idx_s = np.random.choice(len(Xs), min(500, len(Xs)), replace=False)
+    idx_t = np.random.choice(len(Xt), min(500, len(Xt)), replace=False)
+    with torch.no_grad():
+        _, feat_s = model(Xs[idx_s].to(DEVICE), return_feat=True)
+        _, feat_t = model(Xt[idx_t].to(DEVICE), return_feat=True)
+
+    # 准备数据
+    data_np = np.vstack([feat_s.cpu().numpy(), feat_t.cpu().numpy()])
+    labels_np = np.concatenate([ys[idx_s].numpy(), yt[idx_t].numpy()])
+    # 创建 "Source" 和 "Target" 标签
+    domain_labels = ["Source"] * len(idx_s) + ["Target"] * len(idx_t)
+
+    # 降维
+    tsne = TSNE(n_components=2, init='pca', learning_rate='auto', random_state=42)
+    embed = tsne.fit_transform(data_np)
+
+    # 构造 DataFrame (这是 Seaborn 最喜欢的格式，不会报错)
+    df_plot = pd.DataFrame({
+        "x": embed[:, 0],
+        "y": embed[:, 1],
+        "Class": labels_np,
+        "Domain": domain_labels
+    })
+
+    plt.figure(figsize=(10, 8))
+    # 使用 hue 控制颜色(类别), style 控制形状(源/目标)
+    sns.scatterplot(data=df_plot, x="x", y="y", hue="Class", style="Domain",
+                    palette="tab10", markers={"Source": "o", "Target": "X"},
+                    s=80, alpha=0.7)
+
+    plt.title(f"t-SNE Feature Visualization (Task: {SRC_LOAD}->{TGT_LOAD})", fontsize=14)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0.)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_confusion_matrix(model, Xt, yt):
+    print("正在生成混淆矩阵...")
+    model.eval()
+    preds, trues = [], []
+    loader = DataLoader(TensorDataset(Xt, yt), BATCH_SIZE)
+    with torch.no_grad():
+        for bx, by in loader:
+            preds.extend(model(bx.to(DEVICE)).argmax(1).cpu().numpy())
+            trues.extend(by.numpy())
+    cm = confusion_matrix(trues, preds)
+    plt.figure(figsize=(8, 7))
+    sns.heatmap(cm, annot=True, fmt='d', cmap="Blues", square=True)
+    plt.title(f"Confusion Matrix (Target Domain: Load {TGT_LOAD})", fontsize=14)
+    plt.ylabel("True Label");
+    plt.xlabel("Predicted Label");
+    plt.show()
+
+
+# ==========================================
+# 6. 主程序
+# ==========================================
+if __name__ == "__main__":
+    print(f"--- 开始运行可视化程序 ---")
+    print(f"任务: Load {SRC_LOAD} -> Load {TGT_LOAD}")
+    data = load_data(SRC_LOAD, TGT_LOAD, N_SHOT)
+    if data is None: print("❌ 错误: 未找到数据，请检查路径 ./CWRU_data"); exit()
+    X_s, y_s, X_t, y_t = data
+
+    print(">>> 正在训练模型 (请稍候)...")
+    model = PGWBN(10, LOAD_CONFIGS[SRC_LOAD]["rpm"]).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    crit = nn.CrossEntropyLoss()
+    train_loader = DataLoader(TensorDataset(X_s, y_s), BATCH_SIZE, shuffle=True)
+
+    for ep in range(EPOCHS):
+        model.train()
+        total_loss = 0
+        for bx, by in train_loader:
+            opt.zero_grad()
+            loss = crit(model(bx.to(DEVICE)), by.to(DEVICE))
+            loss.backward()
+            opt.step()
+            total_loss += loss.item()
+        if (ep + 1) % 5 == 0: print(f"    Epoch {ep + 1}/{EPOCHS} | Loss: {total_loss:.4f}")
+
+    print(">>> 训练完成，开始绘图...")
+    plot_physics_filters(model)
+    plot_tsne(model, X_s, y_s, X_t, y_t)
+    plot_confusion_matrix(model, X_t, y_t)
+    print(">>> 所有图表已生成。")
