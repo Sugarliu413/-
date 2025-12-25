@@ -1,0 +1,327 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import scipy.fftpack as fftpack
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.manifold import TSNE
+from sklearn.metrics import confusion_matrix
+
+# ==========================================
+# 1. 全局配置 (可视化模式)
+# ==========================================
+BASE_SEED = 42
+DATA_ROOT = "./XJTU-SY_Bearing_Datasets/37.5Hz11kN"  # ⚠️ 确认路径
+SIGNAL_LENGTH = 1000
+N_SHOT = 20  # 训练样本数 (用于可视化演示)
+EPOCHS = 40  # 训练轮数
+BATCH_SIZE = 16
+LR = 0.002
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# XJTU-SY 物理参数
+SAMPLE_RATE = 25600
+BALL_DIA = 7.92
+PITCH_DIA = 34.55
+NUM_BALLS = 8
+CURRENT_RPM = 2250
+
+# 绘图设置
+sns.set(style="whitegrid", context="notebook")
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# 初始化随机种子
+def set_seed(seed):
+    random.seed(seed);
+    np.random.seed(seed);
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+
+set_seed(BASE_SEED)
+
+print(f"Dataset: {DATA_ROOT}")
+print(f"Device: {DEVICE}")
+
+
+# ==========================================
+# 2. 物理特征频率计算
+# ==========================================
+def get_xjtu_freqs(rpm, ball, pitch, balls):
+    fr = rpm / 60.0
+    factor = ball / pitch
+    return {
+        "BPFO": 0.5 * balls * fr * (1 - factor),
+        "BPFI": 0.5 * balls * fr * (1 + factor),
+        "BSF": 0.5 * pitch / ball * fr * (1 - factor ** 2),
+        "FTF": 0.5 * fr * (1 - factor)
+    }
+
+
+# ==========================================
+# 3. 数据加载器 (XJTU)
+# ==========================================
+def load_xjtu_data(n_shot, seed):
+    # 映射表: 0=Outer, 1=Inner, 2=Cage
+    bearing_map = {
+        "Bearing2_1": 1,  # Inner
+        "Bearing2_2": 0,  # Outer
+        "Bearing2_3": 2,  # Cage
+        "Bearing2_4": 0,  # Outer
+        "Bearing2_5": 0  # Outer
+    }
+
+    Xtr, ytr, Xte, yte = [], [], [], []
+
+    for bearing, label in bearing_map.items():
+        folder = os.path.join(DATA_ROOT, bearing)
+        if not os.path.exists(folder):
+            continue
+
+        files = sorted(
+            [f for f in os.listdir(folder) if f.endswith(".csv")],
+            key=lambda x: int(x.split(".")[0])
+        )
+
+        if len(files) < 6: continue
+
+        # 防泄露划分
+        test_files = files[-5:]  # 最后5个文件做测试
+        train_pool = files[-20:-5]  # 中间15个文件做训练池
+
+        if len(train_pool) == 0: continue
+
+        # 随机抽取 n_shot
+        random.seed(seed)
+        random.shuffle(train_pool)
+        train_files = train_pool[:min(n_shot, len(train_pool))]
+
+        def load_segments(file_list):
+            segs = []
+            for f in file_list:
+                try:
+                    df = pd.read_csv(os.path.join(folder, f))
+                    sig = df.iloc[:, 0].values  # 读取第一列振动信号
+                    if len(sig) < SIGNAL_LENGTH: continue
+
+                    # 切割
+                    n_seg = len(sig) // SIGNAL_LENGTH
+                    for i in range(n_seg):
+                        s = sig[i * SIGNAL_LENGTH:(i + 1) * SIGNAL_LENGTH]
+                        # 归一化
+                        s = (s - s.mean()) / (s.std() + 1e-8)
+                        segs.append(s)
+                except:
+                    pass
+            return segs
+
+        tr_segs = load_segments(train_files)
+        te_segs = load_segments(test_files)
+
+        if len(tr_segs) == 0 or len(te_segs) == 0: continue
+
+        random.shuffle(tr_segs)
+        random.shuffle(te_segs)
+
+        Xtr.extend(tr_segs[:n_shot])  # 限制训练集数量
+        ytr.extend([label] * len(tr_segs[:n_shot]))
+
+        Xte.extend(te_segs[:50])  # 限制测试集数量(为了tSNE不拥挤)
+        yte.extend([label] * len(te_segs[:50]))
+
+    if len(Xtr) == 0: return None
+
+    return (
+        torch.tensor(np.array(Xtr), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(ytr).long(),
+        torch.tensor(np.array(Xte), dtype=torch.float32).unsqueeze(1),
+        torch.tensor(yte).long(),
+        3  # 类别数: Inner, Outer, Cage
+    )
+
+
+# ==========================================
+# 4. PGWBN 模型 (带特征提取)
+# ==========================================
+class HarmonicInitConv1d(nn.Conv1d):
+    def __init__(self, in_c, out_c, center, sr, k=65):
+        super().__init__(in_c, out_c, k, padding=k // 2, bias=False)
+        t = np.linspace(-k / 2 / sr, k / 2 / sr, k)
+        with torch.no_grad():
+            for i in range(out_c):
+                fb = center * np.random.uniform(0.95, 1.05)
+                w = np.sum(
+                    [np.cos(2 * np.pi * fb * h * t) * np.exp(-t ** 2 / (2 * (4 / (2 * np.pi * fb * h)) ** 2)) for h in
+                     [1, 2, 3]], axis=0)
+                w = w / (np.linalg.norm(w) + 1e-8)
+                self.weight[i, :] = torch.tensor(w)
+
+
+class PGWBN_XJTU(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        freqs = get_xjtu_freqs(CURRENT_RPM, BALL_DIA, PITCH_DIA, NUM_BALLS)
+
+        self.pb = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 8, 64, 2, 31, bias=False), nn.BatchNorm1d(8), nn.ReLU(),
+                HarmonicInitConv1d(8, 16, f, SAMPLE_RATE / 2),  # 可视化层
+                nn.BatchNorm1d(16), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+            ) for f in freqs.values()
+        ])
+
+        self.rb = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(1, 16, 64, 2, 31), nn.BatchNorm1d(16), nn.ReLU(), nn.MaxPool1d(2),
+                nn.Conv1d(16, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+                nn.Conv1d(32, 32, 3, 1, 1), nn.BatchNorm1d(32), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
+            ) for _ in range(2)
+        ])
+
+        self.p_dim = 32 * len(self.pb)
+        self.total_dim = self.p_dim + 32 * len(self.rb)
+
+        self.fuse = nn.Sequential(
+            nn.Linear(self.total_dim, self.total_dim // 2), nn.ReLU(),
+            nn.Linear(self.total_dim // 2, self.p_dim), nn.Sigmoid()
+        )
+
+        self.fc = nn.Sequential(
+            nn.Dropout(0.5), nn.Linear(self.total_dim, 64), nn.ReLU(), nn.Linear(64, num_classes)
+        )
+
+    def forward(self, x, return_feat=False):
+        p_list = [b(x).view(x.size(0), -1) for b in self.pb]
+        r_list = [b(x).view(x.size(0), -1) for b in self.rb]
+        p = torch.cat(p_list, 1)
+        r = torch.cat(r_list, 1)
+
+        gate = self.fuse(torch.cat([p, r], 1))
+        p_gated = p * gate
+        feat = torch.cat([p_gated, r], 1)
+
+        out = self.fc(feat)
+        if return_feat: return out, feat
+        return out
+
+
+# ==========================================
+# 5. 可视化绘图函数
+# ==========================================
+def plot_physics_filters(model):
+    print("生成物理滤波器可视化...")
+    layer = model.pb[0][3]
+    weights = layer.weight.detach().cpu().numpy()
+    k_size = weights.shape[2]
+
+    fig, axes = plt.subplots(3, 2, figsize=(10, 8))
+    fig.suptitle("XJTU-SY Interpretability: Learned Wavelet Filters", fontsize=15)
+
+    t = np.linspace(0, k_size / SAMPLE_RATE, k_size)
+    xf = np.linspace(0, SAMPLE_RATE / 2, k_size // 2)
+
+    for i in range(3):
+        w = weights[i, 0, :]
+        axes[i, 0].plot(t, w, color='#1f77b4')
+        axes[i, 0].set_title(f"Filter {i + 1} (Time Domain)")
+        axes[i, 0].grid(True, alpha=0.3)
+
+        yf = fftpack.fft(w)
+        axes[i, 1].plot(xf, 2.0 / k_size * np.abs(yf[:k_size // 2]), color='#ff7f0e')
+        axes[i, 1].set_title(f"Filter {i + 1} (Freq Domain)")
+        axes[i, 1].grid(True, alpha=0.3)
+    plt.tight_layout();
+    plt.show()
+
+
+def plot_tsne(model, X, y):
+    print("生成 t-SNE 特征分布图...")
+    model.eval()
+    with torch.no_grad():
+        _, feats = model(X.to(DEVICE), return_feat=True)
+
+    feats = feats.cpu().numpy()
+    labels = y.numpy()
+
+    # 映射标签名
+    label_names = {0: "Outer", 1: "Inner", 2: "Cage"}
+    str_labels = [label_names[l] for l in labels]
+
+    tsne = TSNE(n_components=2, init='pca', learning_rate='auto', random_state=42)
+    embed = tsne.fit_transform(feats)
+
+    df_plot = pd.DataFrame({
+        "x": embed[:, 0], "y": embed[:, 1], "Label": str_labels
+    })
+
+    plt.figure(figsize=(9, 7))
+    sns.scatterplot(data=df_plot, x="x", y="y", hue="Label", palette="Set1", s=100, alpha=0.8)
+    plt.title(f"t-SNE Visualization (XJTU-SY 37.5Hz, N={N_SHOT})", fontsize=14)
+    plt.show()
+
+
+def plot_confusion_matrix(model, X, y):
+    print("生成混淆矩阵...")
+    model.eval()
+    with torch.no_grad():
+        preds = model(X.to(DEVICE)).argmax(1).cpu().numpy()
+
+    labels = y.numpy()
+    cm = confusion_matrix(labels, preds)
+
+    label_names = ["Outer", "Inner", "Cage"]
+
+    plt.figure(figsize=(7, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap="Greens", square=True,
+                xticklabels=label_names, yticklabels=label_names)
+    plt.title("Confusion Matrix (Test Set)", fontsize=14)
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.show()
+
+
+# ==========================================
+# 6. 主程序
+# ==========================================
+if __name__ == "__main__":
+    print(f"--- XJTU-SY Visualization Start ---")
+
+    # 1. 加载数据
+    data_pkg = load_xjtu_data(N_SHOT, BASE_SEED)
+    if data_pkg is None:
+        print("❌ 错误: 未找到数据，请检查 XJTU-SY 路径!")
+        exit()
+
+    Xtr, ytr, Xte, yte, numc = data_pkg
+    print(f"Train samples: {len(Xtr)} | Test samples: {len(Xte)} | Classes: {numc}")
+
+    # 2. 训练
+    model = PGWBN_XJTU(numc).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    crit = nn.CrossEntropyLoss()
+    tr_dl = DataLoader(TensorDataset(Xtr, ytr), BATCH_SIZE, shuffle=True)
+
+    print("Training...", end="")
+    for ep in range(EPOCHS):
+        model.train()
+        for bx, by in tr_dl:
+            opt.zero_grad()
+            loss = crit(model(bx.to(DEVICE)), by.to(DEVICE))
+            loss.backward()
+            opt.step()
+        if ep % 10 == 0: print(".", end="")
+    print(" Done!")
+
+    # 3. 绘图
+    plot_physics_filters(model)  # 解释性
+    plot_tsne(model, Xte, yte)  # 特征分布 (仅测试集)
+    plot_confusion_matrix(model, Xte, yte)  # 结果分析
+
+    print("--- Visualization Finished ---")
